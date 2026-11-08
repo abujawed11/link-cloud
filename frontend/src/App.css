@@ -199,3 +199,35 @@ button.link {
     flex-wrap: wrap;
   }
 }
+
+/* Phase 2: progress states and job badges */
+.bar-warn {
+  background: var(--danger);
+}
+/* No content-length: show a sliding stripe instead of a stuck 0% bar. */
+.bar-indeterminate {
+  width: 100% !important;
+  background: linear-gradient(
+    90deg,
+    var(--border) 0%,
+    var(--accent) 50%,
+    var(--border) 100%
+  );
+  background-size: 200% 100%;
+  animation: slide 1.4s linear infinite;
+}
+@keyframes slide {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+.badge.queued {
+  background: var(--border);
+}
+.badge.cancelled {
+  background: var(--muted, #888);
+  color: #fff;
+}

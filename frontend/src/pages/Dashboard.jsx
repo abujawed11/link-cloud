@@ -3,17 +3,23 @@ import { api } from '../api/client'
 import UrlForm from '../components/UrlForm'
 import JobList from '../components/JobList'
 import FileList from '../components/FileList'
+import UsageBar from '../components/UsageBar'
+import useJobStream from '../hooks/useJobStream'
 
-const POLL_MS = 2500
+// SSE carries live progress; polling is the fallback and also catches rows that
+// changed while the stream was down.
+const POLL_MS = 8000
 
 export default function Dashboard({ user, onLogout, onUnauthorized }) {
   const [jobs, setJobs] = useState([])
   const [files, setFiles] = useState([])
+  const [usage, setUsage] = useState(null)
   const doneCount = useRef(0)
 
   const loadFiles = useCallback(async () => {
     try {
       setFiles((await api('/files')).files)
+      setUsage(await api('/jobs/usage'))
     } catch (err) {
       if (err.status === 401) onUnauthorized()
     }
@@ -34,6 +40,26 @@ export default function Dashboard({ user, onLogout, onUnauthorized }) {
     }
   }, [loadFiles, onUnauthorized])
 
+  // Merge a live snapshot into the job we already have.
+  const applyProgress = useCallback(
+    (snap) => {
+      setJobs((current) => {
+        const index = current.findIndex((j) => Number(j.id) === Number(snap.id))
+        if (index === -1) {
+          loadJobs() // a job we have not seen yet
+          return current
+        }
+        const next = [...current]
+        next[index] = { ...next[index], ...snap }
+        return next
+      })
+      if (snap.status === 'done') loadFiles()
+    },
+    [loadJobs, loadFiles]
+  )
+
+  useJobStream(applyProgress)
+
   useEffect(() => {
     loadJobs()
     loadFiles()
@@ -52,8 +78,9 @@ export default function Dashboard({ user, onLogout, onUnauthorized }) {
           </button>
         </span>
       </header>
-      <UrlForm onCreated={loadJobs} />
-      <JobList jobs={jobs} />
+      <UrlForm onCreated={loadJobs} usage={usage} />
+      <UsageBar usage={usage} />
+      <JobList jobs={jobs} onChanged={loadJobs} />
       <FileList files={files} onChanged={loadFiles} />
     </main>
   )

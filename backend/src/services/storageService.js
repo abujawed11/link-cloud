@@ -35,6 +35,24 @@ function sanitizeFilename(name) {
   return clean || 'download';
 }
 
+// Free bytes on the volume holding the storage directory.
+async function freeBytes() {
+  try {
+    const stats = await fs.promises.statfs(storageRoot);
+    return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null; // unknown: callers treat this as "do not block"
+  }
+}
+
+// Does writing `bytes` more keep us above the configured free-space floor?
+async function hasRoomFor(bytes) {
+  const free = await freeBytes();
+  if (free === null) return { ok: true, free: null };
+  const needed = Number(bytes || 0) + env.limits.minFreeDiskBytes;
+  return { ok: free >= needed, free };
+}
+
 async function removeFile(storedName) {
   try {
     await fs.promises.unlink(filePath(storedName));
@@ -43,4 +61,13 @@ async function removeFile(storedName) {
   }
 }
 
-module.exports = { ensureStorage, newStoredName, filePath, sanitizeFilename, removeFile };
+module.exports = {
+  ensureStorage,
+  newStoredName,
+  filePath,
+  sanitizeFilename,
+  removeFile,
+  freeBytes,
+  hasRoomFor,
+  storageRoot,
+};

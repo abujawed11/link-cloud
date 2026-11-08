@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { api } from '../api/client'
+import { formatBytes } from '../utils/format'
 
-export default function UrlForm({ onCreated }) {
+export default function UrlForm({ onCreated, usage }) {
   const [url, setUrl] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -37,6 +38,11 @@ export default function UrlForm({ onCreated }) {
         </button>
       </div>
       {error && <p className="err">{error}</p>}
+      {usage?.max_file_bytes && (
+        <p className="muted small">
+          Direct links only (http/https). Up to {formatBytes(usage.max_file_bytes)} per file.
+        </p>
+      )}
     </form>
   )
 }

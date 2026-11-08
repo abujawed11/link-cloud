@@ -2,12 +2,46 @@
 // instead of the API calling it directly.
 const fs = require('fs');
 const path = require('path');
-const { Readable, Transform } = require('stream');
+const { Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const pool = require('../config/db');
+const env = require('../config/env');
 const storage = require('./storageService');
+const { safeGet } = require('./httpClient');
+const { httpError } = require('./ssrfGuard');
+const events = require('./jobEvents');
 
-const PROGRESS_INTERVAL_MS = 1000;
+const DB_WRITE_INTERVAL_MS = 1000; // how often progress reaches MySQL
+const EVENT_INTERVAL_MS = 500; // how often progress reaches SSE clients
+const SPEED_WINDOW_MS = 5000; // sliding window used for speed and ETA
+const DISK_RECHECK_MS = 10000; // re-check free space while streaming
+
+const EXT_BY_MIME = {
+  'application/pdf': '.pdf',
+  'application/zip': '.zip',
+  'application/gzip': '.gz',
+  'application/x-tar': '.tar',
+  'application/x-7z-compressed': '.7z',
+  'application/vnd.rar': '.rar',
+  'application/json': '.json',
+  'application/epub+zip': '.epub',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/svg+xml': '.svg',
+  'text/plain': '.txt',
+  'text/csv': '.csv',
+  'text/html': '.html',
+  'video/mp4': '.mp4',
+  'video/x-matroska': '.mkv',
+  'video/webm': '.webm',
+  'audio/mpeg': '.mp3',
+  'audio/flac': '.flac',
+  'audio/ogg': '.ogg',
+};
+
+const formatMb = (bytes) => `${Math.round(Number(bytes) / (1024 * 1024))} MB`;
 
 function nameFromContentDisposition(header) {
   if (!header) return null;
@@ -16,7 +50,7 @@ function nameFromContentDisposition(header) {
     try {
       return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
     } catch {
-      /* fall through to plain filename */
+      /* fall through to the plain filename form */
     }
   }
   const plain = /filename\s*=\s*("([^"]+)"|[^;]+)/i.exec(header);
@@ -32,64 +66,230 @@ function nameFromUrl(url) {
   }
 }
 
+// Content-Disposition, then the final URL's path, then the original URL.
+// If the resulting name has no extension but the MIME type implies one, add it.
+function pickFilename({ disposition, finalUrl, sourceUrl, contentType }) {
+  const mime = String(contentType || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  const raw =
+    nameFromContentDisposition(disposition) || nameFromUrl(finalUrl) || nameFromUrl(sourceUrl);
+  let name = storage.sanitizeFilename(raw) || 'download';
+  const ext = EXT_BY_MIME[mime];
+  if (ext && !path.extname(name)) name += ext;
+  return name;
+}
+
 async function updateJob(id, fields) {
   const keys = Object.keys(fields);
+  if (keys.length === 0) return;
   const sql = `UPDATE jobs SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`;
   await pool.query(sql, [...keys.map((k) => fields[k]), id]);
 }
 
-async function run(job) {
-  await updateJob(job.id, { status: 'downloading', progress: 0, bytes_downloaded: 0, error: null });
-
-  const res = await fetch(job.url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`Remote server responded ${res.status} ${res.statusText}`);
-  if (!res.body) throw new Error('Remote server sent no data');
-
-  const total = Number(res.headers.get('content-length')) || null;
-  const originalName = storage.sanitizeFilename(
-    nameFromContentDisposition(res.headers.get('content-disposition')) ||
-      nameFromUrl(res.url || job.url)
+async function userUsageBytes(userId) {
+  const [[row]] = await pool.query(
+    'SELECT COALESCE(SUM(size_bytes), 0) AS total FROM files WHERE user_id = ?',
+    [userId]
   );
-  const storedName = storage.newStoredName();
-  const dest = storage.filePath(storedName);
+  return Number(row.total);
+}
 
-  let received = 0;
-  let lastReport = 0;
-  const counter = new Transform({
-    transform(chunk, _enc, cb) {
-      received += chunk.length;
-      const now = Date.now();
-      if (now - lastReport >= PROGRESS_INTERVAL_MS) {
-        lastReport = now;
-        updateJob(job.id, {
-          bytes_downloaded: received,
-          bytes_total: total,
-          progress: total ? Math.min(99, Math.floor((received / total) * 100)) : 0,
-        }).catch(() => {});
-      }
-      cb(null, chunk);
-    },
-  });
-
-  try {
-    await pipeline(Readable.fromWeb(res.body), counter, fs.createWriteStream(dest));
-  } catch (err) {
-    await storage.removeFile(storedName); // never leave partial files behind
-    throw err;
+// Checks that must pass before a single byte is written. Returns how many more
+// bytes this user may store, so the stream can stop at the quota.
+async function assertCanStore(userId, declaredSize) {
+  const { maxFileBytes, userQuotaBytes } = env.limits;
+  if (declaredSize && maxFileBytes && declaredSize > maxFileBytes) {
+    throw httpError(413, `File is larger than the ${formatMb(maxFileBytes)} limit`);
   }
 
-  const [result] = await pool.query(
-    `INSERT INTO files (user_id, original_name, stored_name, size_bytes, mime_type, source_url)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [job.user_id, originalName, storedName, received, res.headers.get('content-type'), job.url]
-  );
-  await updateJob(job.id, {
-    status: 'done',
-    progress: 100,
-    bytes_downloaded: received,
-    bytes_total: total ?? received,
-    file_id: result.insertId,
-  });
+  let quotaRemaining = null;
+  if (userQuotaBytes) {
+    const used = await userUsageBytes(userId);
+    quotaRemaining = userQuotaBytes - used;
+    if (quotaRemaining <= 0 || (declaredSize && declaredSize > quotaRemaining)) {
+      throw httpError(
+        507,
+        `Storage quota reached (${formatMb(used)} of ${formatMb(userQuotaBytes)} used)`
+      );
+    }
+  }
+
+  const room = await storage.hasRoomFor(declaredSize || 0);
+  if (!room.ok) throw httpError(507, 'Not enough free disk space on the server');
+
+  return { quotaRemaining };
+}
+
+// An AbortError hides the real reason; surface whatever triggered the abort.
+function normalizeAbort(err, controller) {
+  if (err?.name !== 'AbortError' && err?.code !== 'ABORT_ERR') return err;
+  const reason = controller.signal.reason;
+  // An abort with no reason of our own (or the default DOMException) is a cancel.
+  if (reason instanceof Error && reason.name !== 'AbortError') return reason;
+  return Object.assign(new Error('Download cancelled'), { cancelled: true });
+}
+
+async function run(job) {
+  const controller = new AbortController();
+  events.registerActive(job.id, job.user_id, controller);
+
+  const totalTimer = env.limits.totalTimeoutMs
+    ? setTimeout(
+        () => controller.abort(new Error('Download exceeded the time limit')),
+        env.limits.totalTimeoutMs
+      )
+    : null;
+
+  let storedName = null;
+  try {
+    await updateJob(job.id, {
+      status: 'downloading',
+      progress: 0,
+      bytes_downloaded: 0,
+      bytes_total: null,
+      error: null,
+    });
+    events.publish({
+      id: job.id,
+      user_id: job.user_id,
+      status: 'downloading',
+      progress: 0,
+      bytes_downloaded: 0,
+      bytes_total: null,
+      speed_bps: 0,
+    });
+
+    const { res, finalUrl } = await safeGet(job.url, { signal: controller.signal });
+    const declared = Number(res.headers['content-length']);
+    const total = Number.isFinite(declared) && declared > 0 ? declared : null;
+
+    let quotaRemaining;
+    try {
+      ({ quotaRemaining } = await assertCanStore(job.user_id, total));
+    } catch (err) {
+      res.destroy();
+      throw err;
+    }
+
+    const contentType = (res.headers['content-type'] || '').split(';')[0].trim() || null;
+    const originalName = pickFilename({
+      disposition: res.headers['content-disposition'],
+      finalUrl,
+      sourceUrl: job.url,
+      contentType,
+    });
+    storedName = storage.newStoredName();
+    const dest = storage.filePath(storedName);
+
+    let received = 0;
+    let lastDbWrite = 0;
+    let lastEvent = 0;
+    let lastDiskCheck = Date.now();
+    const window = [{ at: Date.now(), bytes: 0 }];
+
+    const speedBps = () => {
+      const now = Date.now();
+      while (window.length > 1 && now - window[0].at > SPEED_WINDOW_MS) window.shift();
+      const span = now - window[0].at;
+      return span > 250 ? Math.max(0, Math.round(((received - window[0].bytes) / span) * 1000)) : 0;
+    };
+
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+
+        // Enforce the limits again while streaming: Content-Length may be absent or lie.
+        if (env.limits.maxFileBytes && received > env.limits.maxFileBytes) {
+          return cb(
+            httpError(413, `File is larger than the ${formatMb(env.limits.maxFileBytes)} limit`)
+          );
+        }
+        if (quotaRemaining != null && received > quotaRemaining) {
+          return cb(httpError(507, 'Storage quota reached'));
+        }
+
+        const now = Date.now();
+        window.push({ at: now, bytes: received });
+        const progress = total ? Math.min(99, Math.floor((received / total) * 100)) : 0;
+
+        if (now - lastEvent >= EVENT_INTERVAL_MS) {
+          lastEvent = now;
+          events.publish({
+            id: job.id,
+            user_id: job.user_id,
+            status: 'downloading',
+            progress,
+            bytes_downloaded: received,
+            bytes_total: total,
+            speed_bps: speedBps(),
+          });
+        }
+        if (now - lastDbWrite >= DB_WRITE_INTERVAL_MS) {
+          lastDbWrite = now;
+          updateJob(job.id, { bytes_downloaded: received, bytes_total: total, progress }).catch(
+            () => {}
+          );
+        }
+        // Watch the disk too, for streams that never declared a length.
+        if (now - lastDiskCheck >= DISK_RECHECK_MS) {
+          lastDiskCheck = now;
+          storage
+            .hasRoomFor(0)
+            .then((room) => {
+              if (!room.ok) controller.abort(new Error('Server ran out of disk space'));
+            })
+            .catch(() => {});
+        }
+        cb(null, chunk);
+      },
+    });
+
+    // Abort if the remote stalls: no data at all for idleTimeoutMs.
+    res.setTimeout(env.limits.idleTimeoutMs, () => {
+      res.destroy(httpError(504, 'Remote server stopped sending data'));
+    });
+
+    try {
+      await pipeline(res, meter, fs.createWriteStream(dest), { signal: controller.signal });
+    } catch (err) {
+      throw normalizeAbort(err, controller);
+    }
+
+    if (total && received !== total) {
+      throw httpError(502, `Incomplete download (${received} of ${total} bytes)`);
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO files (user_id, original_name, stored_name, size_bytes, mime_type, source_url)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [job.user_id, originalName, storedName, received, contentType, job.url]
+    );
+    storedName = null; // the file row owns it now
+
+    await updateJob(job.id, {
+      status: 'done',
+      progress: 100,
+      bytes_downloaded: received,
+      bytes_total: total ?? received,
+      file_id: result.insertId,
+    });
+    events.publish({
+      id: job.id,
+      user_id: job.user_id,
+      status: 'done',
+      progress: 100,
+      bytes_downloaded: received,
+      bytes_total: total ?? received,
+      file_id: result.insertId,
+    });
+  } finally {
+    if (totalTimer) clearTimeout(totalTimer);
+    events.unregisterActive(job.id);
+    // Anything still owned here is a partial file: never leave it behind.
+    if (storedName) await storage.removeFile(storedName).catch(() => {});
+  }
 }
 
 async function start(jobId) {
@@ -99,11 +299,20 @@ async function start(jobId) {
   try {
     await run(job);
   } catch (err) {
-    console.error(`Job ${jobId} failed:`, err.message);
-    await updateJob(jobId, { status: 'failed', error: String(err.message).slice(0, 1000) }).catch(
-      () => {}
-    );
+    const cancelled = err?.cancelled === true || err?.status === 499;
+    const message = String(err?.message || 'Download failed').slice(0, 1000);
+    if (!cancelled) console.error(`Job ${jobId} failed:`, message);
+    await updateJob(jobId, {
+      status: cancelled ? 'cancelled' : 'failed',
+      error: cancelled ? null : message,
+    }).catch(() => {});
+    events.publish({
+      id: Number(jobId),
+      user_id: job.user_id,
+      status: cancelled ? 'cancelled' : 'failed',
+      error: cancelled ? null : message,
+    });
   }
 }
 
-module.exports = { start };
+module.exports = { start, userUsageBytes, pickFilename };
