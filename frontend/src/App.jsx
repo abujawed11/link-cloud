@@ -1,27 +1,30 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from './api/client'
+import Login from './pages/Login'
+import Dashboard from './pages/Dashboard'
 import './App.css'
 
 function App() {
-  const [health, setHealth] = useState(null)
-  const [error, setError] = useState(null)
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    api('/health').then(setHealth).catch((e) => setError(e.message))
+    api('/auth/me')
+      .then((r) => setUser(r.user))
+      .catch(() => setUser(null))
+      .finally(() => setLoading(false))
   }, [])
 
-  return (
-    <main className="app">
-      <h1>Link Cloud</h1>
-      {error && <p className="err">API unreachable: {error}</p>}
-      {health && (
-        <p>
-          API: {health.status} | Database: {health.db}
-        </p>
-      )}
-      {!health && !error && <p>Checking API...</p>}
-    </main>
-  )
+  const logout = useCallback(async () => {
+    await api('/auth/logout', { method: 'POST' }).catch(() => {})
+    setUser(null)
+  }, [])
+
+  const expired = useCallback(() => setUser(null), [])
+
+  if (loading) return <main className="app"><p className="muted">Loading...</p></main>
+  if (!user) return <Login onAuthed={setUser} />
+  return <Dashboard user={user} onLogout={logout} onUnauthorized={expired} />
 }
 
 export default App

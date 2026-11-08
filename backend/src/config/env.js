@@ -11,5 +11,7 @@ module.exports = {
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'link_cloud',
   },
+  jwtSecret: process.env.JWT_SECRET || '',
+  allowRegistration: process.env.ALLOW_REGISTRATION === 'true',
   storageDir: process.env.STORAGE_DIR || './storage',
 };

@@ -150,24 +150,31 @@ link-cloud/
 - Verified: API starts, `/api/health` returns 200 (`db: down` until MySQL is configured), 404 handler works, frontend builds.
 
 ### Phase 1: Core MVP (login, download, store, list, re-download)
-**Status:** Not started
+**Status:** Done (verified via API tests; UI not yet clicked through in a browser)
 
 Backend
-- [ ] Auth: register/login with bcrypt + JWT (or session cookie); auth middleware
-- [ ] `storageService`: storage dir config, safe filename, random stored name
-- [ ] `downloadService.start(jobId)`: stream URL to disk, update job row, create `files` row on success, clean up partial file on failure
-- [ ] `POST /api/jobs` creates job row and kicks off download (fire-and-forget in-process)
-- [ ] `GET /api/jobs`, `GET /api/jobs/:id`
-- [ ] `GET /api/files`, `GET /api/files/:id/download` (streamed, authenticated), `DELETE /api/files/:id`
+- [x] Auth: register/login with bcrypt + JWT (or session cookie); auth middleware
+- [x] `storageService`: storage dir config, safe filename, random stored name
+- [x] `downloadService.start(jobId)`: stream URL to disk, update job row, create `files` row on success, clean up partial file on failure
+- [x] `POST /api/jobs` creates job row and kicks off download (fire-and-forget in-process)
+- [x] `GET /api/jobs`, `GET /api/jobs/:id`
+- [x] `GET /api/files`, `GET /api/files/:id/download` (streamed, authenticated), `DELETE /api/files/:id`
 
 Frontend
-- [ ] Login page
-- [ ] Dashboard: URL input and Download button
-- [ ] Jobs list with status (polling every 2-3 s is fine for now)
-- [ ] Files list with Download and Delete buttons
-- [ ] Basic error and empty states
+- [x] Login page
+- [x] Dashboard: URL input and Download button
+- [x] Jobs list with status (polling every 2-3 s is fine for now)
+- [x] Files list with Download and Delete buttons
+- [x] Basic error and empty states
 
 **Done when:** you can log in, paste a direct file URL, see it finish, then download it again from the list.
+
+**Phase 1 notes:**
+- Auth: JWT in an httpOnly cookie (7 days). Registration is open only while no user exists (first user becomes `admin`); set `ALLOW_REGISTRATION=true` in `backend/.env` to allow more sign-ups. `JWT_SECRET` is required (server refuses to start with the placeholder).
+- `downloadService.start(jobId)` uses Node's built-in `fetch`, streams to `STORAGE_DIR/<uuid>`, writes progress at most once per second, and deletes partial files on failure. `jobController.create` calls it fire-and-forget (Phase 3: swap for `queue.add()`).
+- Frontend polls `/api/jobs` every 2.5 s; the file list refreshes when a job finishes.
+- Tested with curl against a local test file: register, login, bad login, unauthenticated access (401), bad URL, successful download (byte-identical), remote 404 recorded as `failed`, authenticated download, delete (file removed from disk), logout. Test user and data were removed afterwards.
+- **Known gaps (all Phase 2):** no SSRF protection (a logged-in user can make the server fetch internal URLs), no size/disk/timeouts limits, no rate limiting, jobs stuck in `downloading` if the server restarts mid-download.
 
 ### Phase 2: Hardening and Live Progress
 **Status:** Not started
@@ -237,6 +244,7 @@ Frontend
 | 2026-11-08 | Download logic isolated in `downloadService` | Makes Phase 3 BullMQ migration a small change |
 | 2026-11-08 | Files served only through authenticated route | Prevents public access and abuse |
 | 2026-11-08 | Folders named `frontend/` and `backend/` (user created them) | Plan updated to match |
+| 2026-11-08 | Single-user default: registration closes after first account; JWT in httpOnly cookie | Open questions unanswered, safest defaults; easy to change |
 | 2026-11-08 | `yt-dlp` / site-specific downloaders out of scope for MVP | Legal/ToS risk and extra complexity |
 
 ## 12. Changelog
@@ -244,4 +252,5 @@ Frontend
 | Date | Who | Change |
 |---|---|---|
 | 2026-11-08 | Claude | Created initial plan (no code written yet) |
+| 2026-11-08 | Claude | Phase 1 done: auth, download service, jobs/files API, React login/dashboard |
 | 2026-11-08 | Claude | Phase 0 done: Express scaffold (config, db pool, schema.sql, health route, error handler), Vite proxy, status page |

@@ -49,6 +49,19 @@ This runs `src/db/schema.sql`, which creates the `users`, `files`, and `jobs` ta
 - Open `src/db/schema.sql` in Workbench and run it directly.
 - Or delete the first two lines of `schema.sql` (`CREATE DATABASE ...` and `USE link_cloud;`) and run `npm run db:init` again.
 
+## 3b. Create the admin account (optional)
+
+Instead of using the sign-up form, you can seed the admin from `backend/`:
+
+```
+npm run db:seed-admin -- admin@example.com "StrongPassword123"
+```
+
+- Password must be at least 8 characters.
+- If the email already exists, its password is reset and its role is set to `admin`, so this also works as a **password reset**.
+- Registration closes automatically once any user exists (unless `ALLOW_REGISTRATION=true`).
+- You can also pass `ADMIN_EMAIL` and `ADMIN_PASSWORD` as environment variables instead of arguments.
+
 ## 4. Verify
 
 1. Start the API: `npm run dev`
