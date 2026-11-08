@@ -67,12 +67,12 @@ Disk: /var/link-cloud/files   (outside web root, never served statically)
 ```
 link-cloud/
   PLAN.md
-  client/                  # React + Vite
+  frontend/                # React + Vite
     src/
       pages/               # Login, Dashboard, Files
       components/          # UrlForm, JobList, FileList, ProgressBar
       api/                 # fetch wrappers
-  server/
+  backend/
     src/
       config/              # env, db connection
       db/                  # schema.sql, migrations
@@ -134,14 +134,20 @@ link-cloud/
 ## 9. Phases
 
 ### Phase 0: Setup and Foundations
-**Status:** Not started
+**Status:** Done (MySQL not yet connected locally; see notes)
 
-- [ ] Create `client/` (Vite + React) and `server/` (Express) folders
-- [ ] `.env.example`, `.gitignore`, ESLint/Prettier (optional)
-- [ ] MySQL connection config (`mysql2` pool)
-- [ ] `schema.sql` for `users`, `files`, `jobs`
-- [ ] Health-check route `GET /api/health`
-- [ ] Central error handler and request logging
+- [x] Create `frontend/` (Vite + React) and `backend/` (Express) folders
+- [x] `.env.example`, `.gitignore`, ESLint/Prettier (optional)
+- [x] MySQL connection config (`mysql2` pool)
+- [x] `schema.sql` for `users`, `files`, `jobs`
+- [x] Health-check route `GET /api/health`
+- [x] Central error handler and request logging
+
+**Phase 0 notes:**
+- Backend: `cd backend && npm run dev` (port 4000). `npm run db:init` creates the DB and tables from `src/db/schema.sql` (needs MySQL running and credentials in `backend/.env`, copied from `.env.example`).
+- Frontend: `cd frontend && npm run dev` (port 5173). Vite proxies `/api` to `localhost:4000`. The page shows API and DB health.
+- Linting uses oxlint (from the Vite template); Prettier not added.
+- Verified: API starts, `/api/health` returns 200 (`db: down` until MySQL is configured), 404 handler works, frontend builds.
 
 ### Phase 1: Core MVP (login, download, store, list, re-download)
 **Status:** Not started
@@ -230,6 +236,7 @@ Frontend
 | 2026-11-08 | Stack: React + Express + Node + MySQL; Redis + BullMQ later | User preference; BullMQ suits download jobs |
 | 2026-11-08 | Download logic isolated in `downloadService` | Makes Phase 3 BullMQ migration a small change |
 | 2026-11-08 | Files served only through authenticated route | Prevents public access and abuse |
+| 2026-11-08 | Folders named `frontend/` and `backend/` (user created them) | Plan updated to match |
 | 2026-11-08 | `yt-dlp` / site-specific downloaders out of scope for MVP | Legal/ToS risk and extra complexity |
 
 ## 12. Changelog
@@ -237,3 +244,4 @@ Frontend
 | Date | Who | Change |
 |---|---|---|
 | 2026-11-08 | Claude | Created initial plan (no code written yet) |
+| 2026-11-08 | Claude | Phase 0 done: Express scaffold (config, db pool, schema.sql, health route, error handler), Vite proxy, status page |
