@@ -33,22 +33,24 @@ function guardedLookup(hostname, options, callback) {
   });
 }
 
-function requestOnce(url, { signal }) {
+function requestOnce(url, { signal, rangeStart }) {
   return new Promise((resolve, reject) => {
     const lib = url.protocol === 'https:' ? https : http;
+    const headers = {
+      'user-agent': 'link-cloud/1.0',
+      accept: '*/*',
+      // Ask for the whole file; some servers need an explicit identity encoding
+      // to report a usable content-length.
+      'accept-encoding': 'identity',
+    };
+    // Resuming a paused download: ask for everything from this byte onward.
+    // The server may ignore this and send the whole file again (status 200
+    // instead of 206) - the caller is responsible for checking which happened.
+    if (rangeStart) headers.range = `bytes=${rangeStart}-`;
+
     const req = lib.request(
       url,
-      {
-        method: 'GET',
-        lookup: guardedLookup,
-        headers: {
-          'user-agent': 'link-cloud/1.0',
-          accept: '*/*',
-          // Ask for the whole file; some servers need an explicit identity encoding
-          // to report a usable content-length.
-          'accept-encoding': 'identity',
-        },
-      },
+      { method: 'GET', lookup: guardedLookup, headers },
       (res) => resolve({ res, req })
     );
 
@@ -82,15 +84,28 @@ function requestOnce(url, { signal }) {
  * GET a URL, following (and re-validating) redirects.
  * Resolves to { res, finalUrl } where `res` is a readable IncomingMessage whose
  * headers have arrived. The caller owns the stream and must consume or destroy it.
+ *
+ * Pass `rangeStart` to resume a paused download. The response's status tells
+ * the caller what actually happened: 206 means the server honoured the range
+ * (res is just the remaining bytes); 200 means it ignored Range entirely and
+ * sent the whole file from the start; 416 means the range is no longer valid
+ * (the remote file likely changed size) - the caller must handle all three.
  */
-async function safeGet(startUrl, { signal } = {}) {
+async function safeGet(startUrl, { signal, rangeStart } = {}) {
   let target = (await assertUrlAllowed(startUrl)).url;
   const seen = new Set([target.toString()]);
 
   for (let hop = 0; hop <= env.limits.maxRedirects; hop += 1) {
-    const { res, req } = await requestOnce(target, { signal });
+    const { res, req } = await requestOnce(target, { signal, rangeStart });
 
     if (!REDIRECT_CODES.has(res.statusCode)) {
+      if (res.statusCode === 416) {
+        res.resume();
+        throw Object.assign(
+          httpError(416, 'Remote file no longer matches the paused download', { retryable: false }),
+          { rangeNotSatisfiable: true }
+        );
+      }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume(); // drain so the socket can be released
         // A remote 5xx might recover; a 4xx (dead link, forbidden, ...) will not.

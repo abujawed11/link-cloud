@@ -231,3 +231,12 @@ button.link {
   background: var(--muted, #888);
   color: #fff;
 }
+.badge.paused {
+  background: #b08900;
+  color: #fff;
+}
+
+/* Phase 3: paused download - static bar (not live), no sliding/animation */
+.bar-paused {
+  background: #b08900;
+}

@@ -1,5 +1,7 @@
 const pool = require('../config/db');
+const env = require('../config/env');
 const { getBullJob } = require('../queues/downloadQueue');
+const storage = require('../services/storageService');
 
 // Phase 3: downloads run in a separate worker process, so an API restart no
 // longer kills anything - BullMQ still has the job and the worker (if it is
@@ -11,7 +13,6 @@ async function recoverOrphanedJobs() {
   const [rows] = await pool.query(
     "SELECT id FROM jobs WHERE status IN ('queued', 'downloading')"
   );
-  if (rows.length === 0) return 0;
 
   let orphaned = 0;
   for (const row of rows) {
@@ -27,4 +28,23 @@ async function recoverOrphanedJobs() {
   return orphaned;
 }
 
-module.exports = { recoverOrphanedJobs };
+// A paused job's partial file sits on disk (and against the user's quota)
+// indefinitely otherwise. Anything left paused too long is dropped, the same
+// way the API's own cancel-a-paused-job path does it.
+async function expireStalePaused() {
+  const [rows] = await pool.query(
+    "SELECT id, partial_stored_name FROM jobs WHERE status = 'paused' AND updated_at < (NOW() - INTERVAL ? SECOND)",
+    [Math.round(env.queue.pausedExpiryMs / 1000)]
+  );
+  for (const row of rows) {
+    if (row.partial_stored_name) await storage.removeFile(row.partial_stored_name).catch(() => {});
+    await pool.query(
+      "UPDATE jobs SET status = 'cancelled', error = 'Paused download expired', partial_stored_name = NULL WHERE id = ?",
+      [row.id]
+    );
+  }
+  if (rows.length > 0) console.log(`Expired ${rows.length} stale paused job(s)`);
+  return rows.length;
+}
+
+module.exports = { recoverOrphanedJobs, expireStalePaused };

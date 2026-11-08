@@ -58,6 +58,9 @@ module.exports = {
     // How long a stale per-user concurrency entry survives a crashed worker
     // before it is evicted (must exceed totalTimeoutMs).
     staleActiveMs: num(process.env.STALE_ACTIVE_MS, 0) || 6 * 60 * 60 * 1000 + 5 * 60 * 1000,
+    // A paused download's partial file (and the quota it ties up) is dropped
+    // if nobody resumes or cancels it within this long.
+    pausedExpiryMs: num(process.env.PAUSED_EXPIRY_MS, 0) || 24 * 60 * 60 * 1000,
   },
 
   // Allow downloads from private/loopback addresses (development only).

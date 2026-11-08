@@ -26,10 +26,11 @@ const queueEvents = new QueueEvents(QUEUE_NAME, { connection });
 // id is prefixed rather than used as-is.
 const bullJobId = (dbJobId) => `db-${dbJobId}`;
 
-function addDownloadJob({ dbJobId, userId, url }) {
+function addDownloadJob(data) {
+  const { dbJobId } = data;
   return downloadQueue.add(
     'download',
-    { dbJobId, userId, url },
+    data, // forwarded as-is: {dbJobId, userId, url} plus resumeFrom/partialStoredName/knownTotal when resuming
     { jobId: bullJobId(dbJobId) } // lets us look a BullMQ job up by our own job id
   );
 }

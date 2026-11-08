@@ -9,6 +9,7 @@
     "worker:dev": "node --watch src/workers/downloadWorker.js",
     "worker": "node src/workers/downloadWorker.js",
     "db:init": "node src/db/init.js",
+    "db:migrate": "node src/db/migrate.js",
     "db:seed-admin": "node src/db/seedAdmin.js"
   },
   "license": "ISC",

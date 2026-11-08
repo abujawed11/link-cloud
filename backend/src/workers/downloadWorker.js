@@ -3,7 +3,7 @@
 // calls downloadService.run(). Splitting it out means an API restart (a
 // deploy, a crash) no longer kills an in-flight download - only a worker
 // restart does, and BullMQ's own retry/attempts bookkeeping covers that.
-const { Worker } = require('bullmq');
+const { Worker, UnrecoverableError } = require('bullmq');
 const env = require('../config/env');
 const { connection } = require('../config/redis');
 const { QUEUE_NAME } = require('../queues/downloadQueue');
@@ -17,20 +17,32 @@ if (env.allowPrivateTargets && env.nodeEnv === 'production') {
 }
 ensureStorage();
 
-// So a cancel request from the API process (same box or not) reaches whichever
-// attempt of whichever job is actually running here.
-const stopListeningForCancels = activeJobs.listenForCancels();
+// So a cancel/pause request from the API process (same box or not) reaches
+// whichever attempt of whichever job is actually running here.
+const stopListeningForSignals = activeJobs.listenForSignals();
 
 const worker = new Worker(
   QUEUE_NAME,
   async (bullJob) => {
-    const { dbJobId, userId, url } = bullJob.data;
-    const job = { id: dbJobId, user_id: userId, url };
+    const { dbJobId, userId, url, resumeFrom, partialStoredName, knownTotal } = bullJob.data;
+    const job = { id: dbJobId, user_id: userId, url, resumeFrom, partialStoredName, knownTotal };
     const reporter = { progress: (snapshot) => bullJob.updateProgress(snapshot) };
 
     try {
       return await downloadService.run(job, reporter);
     } catch (err) {
+      if (err?.paused) {
+        // downloadService already wrote the 'paused' DB row and reported it -
+        // just stop BullMQ from retrying this attempt. This BullMQ version has
+        // no job.discard(); the documented way to block a retry is to throw
+        // (or rename to) an UnrecoverableError - shouldRetryJob() checks
+        // `err.name === 'UnrecoverableError'`, so renaming keeps err.paused
+        // and the original message intact for the logging below and for
+        // worker.on('failed').
+        err.name = 'UnrecoverableError';
+        throw err;
+      }
+
       const cancelled = err?.cancelled === true;
       const retryable = !cancelled && err?.retryable !== false;
       // attemptsMade here is the count BEFORE this attempt; BullMQ increments it
@@ -58,7 +70,8 @@ const worker = new Worker(
       if (!willRetry) {
         // Tell BullMQ not to retry: we already decided (cancelled, non-retryable,
         // or genuinely out of attempts) and wrote the final DB status ourselves.
-        await bullJob.discard().catch(() => {});
+        // See the UnrecoverableError note in the `paused` branch above.
+        err.name = 'UnrecoverableError';
       } else {
         console.warn(
           `Job ${dbJobId} attempt ${attemptsAfterThis}/${bullJob.opts.attempts} failed, will retry: ${message}`
@@ -74,13 +87,14 @@ worker.on('error', (err) => console.error('Worker error:', err.message));
 worker.on('completed', (bullJob) => console.log(`Job ${bullJob.data.dbJobId} done`));
 worker.on('failed', (bullJob, err) => {
   if (err?.cancelled) console.log(`Job ${bullJob?.data?.dbJobId} cancelled`);
+  else if (err?.paused) console.log(`Job ${bullJob?.data?.dbJobId} paused`);
 });
 
 console.log(`Download worker started (concurrency ${env.queue.maxConcurrentGlobal})`);
 
 async function shutdown() {
   console.log('Worker shutting down...');
-  stopListeningForCancels();
+  stopListeningForSignals();
   await worker.close();
   process.exit(0);
 }

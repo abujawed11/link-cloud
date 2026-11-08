@@ -2,8 +2,10 @@
 // (src/workers/downloadWorker.js) is the only thing that knows this runs
 // inside a queue. It passes a `reporter` with one method, `progress(snapshot)`,
 // which the worker wires to `bullJob.updateProgress()`; the worker also makes
-// the retry/fail/cancel decision after `run()` throws, because that decision
-// needs BullMQ's attempt count, which this module has no business knowing.
+// the retry/fail decision after `run()` throws, because that decision needs
+// BullMQ's attempt count, which this module has no business knowing. A pause,
+// however, is unconditional and is written to the DB directly from here, the
+// same as a success - see the 'paused' branch below.
 const fs = require('fs');
 const path = require('path');
 const { Transform } = require('stream');
@@ -92,27 +94,39 @@ async function updateJob(id, fields) {
   await pool.query(sql, [...keys.map((k) => fields[k]), id]);
 }
 
-async function userUsageBytes(userId) {
-  const [[row]] = await pool.query(
+// Bytes that count against this user's quota: completed files, plus whatever
+// is sitting in OTHER paused downloads' partial files (excludeJobId lets a job
+// check its own quota room without double-counting its own paused bytes).
+async function userUsageBytes(userId, { excludeJobId } = {}) {
+  const [[filesRow]] = await pool.query(
     'SELECT COALESCE(SUM(size_bytes), 0) AS total FROM files WHERE user_id = ?',
     [userId]
   );
-  return Number(row.total);
+  const pausedParams = excludeJobId ? [userId, excludeJobId] : [userId];
+  const [[pausedRow]] = await pool.query(
+    `SELECT COALESCE(SUM(bytes_downloaded), 0) AS total FROM jobs
+     WHERE user_id = ? AND status = 'paused'${excludeJobId ? ' AND id != ?' : ''}`,
+    pausedParams
+  );
+  return Number(filesRow.total) + Number(pausedRow.total);
 }
 
-// Checks that must pass before a single byte is written. Returns how many more
-// bytes this user may store, so the stream can stop at the quota.
-async function assertCanStore(userId, declaredSize) {
+// Checks that must pass before writing (more) bytes. `fullTotal` is the whole
+// file's size if known; `alreadyOnDisk` is how much of it (if any) is already
+// written, from a previous paused attempt - only the gap needs quota/disk room.
+async function assertCanStore(userId, fullTotal, { alreadyOnDisk = 0, excludeJobId } = {}) {
   const { maxFileBytes, userQuotaBytes } = env.limits;
-  if (declaredSize && maxFileBytes && declaredSize > maxFileBytes) {
+  if (fullTotal && maxFileBytes && fullTotal > maxFileBytes) {
     throw httpError(413, `File is larger than the ${formatMb(maxFileBytes)} limit`);
   }
 
+  const remainingToWrite = fullTotal != null ? Math.max(0, fullTotal - alreadyOnDisk) : null;
+
   let quotaRemaining = null;
   if (userQuotaBytes) {
-    const used = await userUsageBytes(userId);
+    const used = await userUsageBytes(userId, { excludeJobId });
     quotaRemaining = userQuotaBytes - used;
-    if (quotaRemaining <= 0 || (declaredSize && declaredSize > quotaRemaining)) {
+    if (quotaRemaining <= 0 || (remainingToWrite != null && remainingToWrite > quotaRemaining)) {
       throw httpError(
         507,
         `Storage quota reached (${formatMb(used)} of ${formatMb(userQuotaBytes)} used)`
@@ -121,7 +135,7 @@ async function assertCanStore(userId, declaredSize) {
   }
 
   // Disk space can free up by the next attempt, so this one is worth retrying.
-  const room = await storage.hasRoomFor(declaredSize || 0);
+  const room = await storage.hasRoomFor(remainingToWrite || 0);
   if (!room.ok) throw httpError(507, 'Not enough free disk space on the server', { retryable: true });
 
   return { quotaRemaining };
@@ -131,22 +145,96 @@ async function assertCanStore(userId, declaredSize) {
 function normalizeAbort(err, controller) {
   if (err?.name !== 'AbortError' && err?.code !== 'ABORT_ERR') return err;
   const reason = controller.signal.reason;
-  // An abort with no reason of our own (or the default DOMException) is a cancel.
   if (reason instanceof Error && reason.name !== 'AbortError') return reason;
   return Object.assign(new Error('Download cancelled'), { cancelled: true, retryable: false });
+}
+
+// Opens the remote stream, handling resume negotiation: tries a Range request
+// when resuming, and transparently falls back to a fresh full download if the
+// server doesn't honour it (ignores Range and sends everything again, or
+// 416s because the file changed since we paused).
+async function openStream(job, controller) {
+  const resuming = Boolean(job.resumeFrom && job.partialStoredName);
+
+  async function fresh() {
+    const { res, finalUrl } = await safeGet(job.url, { signal: controller.signal });
+    const declared = Number(res.headers['content-length']);
+    return {
+      res,
+      finalUrl,
+      mode: 'fresh',
+      storedName: storage.newStoredName(),
+      startAt: 0,
+      total: Number.isFinite(declared) && declared > 0 ? declared : null,
+    };
+  }
+
+  if (!resuming) return fresh();
+
+  let res;
+  let finalUrl;
+  try {
+    ({ res, finalUrl } = await safeGet(job.url, {
+      signal: controller.signal,
+      rangeStart: job.resumeFrom,
+    }));
+  } catch (err) {
+    if (err.rangeNotSatisfiable) {
+      await storage.removeFile(job.partialStoredName).catch(() => {});
+      return fresh();
+    }
+    throw err;
+  }
+
+  if (res.statusCode !== 206) {
+    // The server ignored Range and sent the whole file from byte 0. This
+    // response IS a fresh, complete stream - just use it instead of asking again.
+    res.__fullBodyFromByteZero = true;
+    await storage.removeFile(job.partialStoredName).catch(() => {});
+    const declared = Number(res.headers['content-length']);
+    return {
+      res,
+      finalUrl,
+      mode: 'fresh',
+      storedName: storage.newStoredName(),
+      startAt: 0,
+      total: Number.isFinite(declared) && declared > 0 ? declared : null,
+    };
+  }
+
+  const match = /\/(\d+)\s*$/.exec(res.headers['content-range'] || '');
+  const rangeTotal = match ? Number(match[1]) : null;
+  if (job.knownTotal && rangeTotal && rangeTotal !== job.knownTotal) {
+    // The remote file changed size since we paused: byte offsets can no
+    // longer be trusted, so start over rather than risk a corrupt file.
+    res.destroy();
+    await storage.removeFile(job.partialStoredName).catch(() => {});
+    return fresh();
+  }
+
+  return {
+    res,
+    finalUrl,
+    mode: 'append',
+    storedName: job.partialStoredName,
+    startAt: job.resumeFrom,
+    total: rangeTotal || job.knownTotal || null,
+  };
 }
 
 /**
  * Run one attempt of a download job.
  *
- * @param {{id:number, user_id:number, url:string}} job - the minimal job shape;
- *   either a MySQL row or the equivalent fields taken from a BullMQ job's data.
+ * @param {object} job - `{id, user_id, url}`, plus `resumeFrom`/`partialStoredName`/
+ *   `knownTotal` to continue a paused download instead of starting over.
  * @param {{progress(snapshot): void}} [reporter] - called often with a progress
  *   snapshot; errors from it are swallowed (it is a side channel, not the
  *   source of truth). Optional so this module stays usable without a queue.
  *
- * Throws on any failure (after cleaning up a partial file). The caller decides
- * what that means for the job as a whole (retry, fail, or cancelled).
+ * Throws on any failure or pause (after cleaning up, or deliberately keeping,
+ * the partial file). The caller decides what a thrown error means for the job
+ * as a whole (retry or fail) - a pause is final here: the 'paused' DB row and
+ * report are already written before this throws, tagged `err.paused`.
  */
 async function run(job, reporter = { progress() {} }) {
   const report = (snapshot) => {
@@ -172,31 +260,36 @@ async function run(job, reporter = { progress() {} }) {
     : null;
 
   let storedName = null;
+  let pausedExit = false;
   try {
+    const resuming = Boolean(job.resumeFrom && job.partialStoredName);
     await updateJob(job.id, {
       status: 'downloading',
-      progress: 0,
-      bytes_downloaded: 0,
-      bytes_total: null,
       error: null,
+      ...(resuming ? {} : { progress: 0, bytes_downloaded: 0, bytes_total: null }),
     });
     report({
       id: job.id,
       user_id: job.user_id,
       status: 'downloading',
-      progress: 0,
-      bytes_downloaded: 0,
-      bytes_total: null,
+      progress: resuming ? 0 : 0,
+      bytes_downloaded: resuming ? job.resumeFrom : 0,
+      bytes_total: resuming ? job.knownTotal ?? null : null,
       speed_bps: 0,
     });
 
-    const { res, finalUrl } = await safeGet(job.url, { signal: controller.signal });
-    const declared = Number(res.headers['content-length']);
-    const total = Number.isFinite(declared) && declared > 0 ? declared : null;
+    const { res, finalUrl, mode, storedName: openedName, startAt, total } = await openStream(
+      job,
+      controller
+    );
+    storedName = openedName;
 
     let quotaRemaining;
     try {
-      ({ quotaRemaining } = await assertCanStore(job.user_id, total));
+      ({ quotaRemaining } = await assertCanStore(job.user_id, total, {
+        alreadyOnDisk: startAt,
+        excludeJobId: job.id,
+      }));
     } catch (err) {
       res.destroy();
       throw err;
@@ -209,14 +302,14 @@ async function run(job, reporter = { progress() {} }) {
       sourceUrl: job.url,
       contentType,
     });
-    storedName = storage.newStoredName();
     const dest = storage.filePath(storedName);
 
-    let received = 0;
+    let received = startAt; // absolute bytes accounted for, including any prior attempt
+    let writtenThisAttempt = 0; // just this attempt's share, for the quota check
     let lastDbWrite = 0;
     let lastEvent = 0;
     let lastDiskCheck = Date.now();
-    const window = [{ at: Date.now(), bytes: 0 }];
+    const window = [{ at: Date.now(), bytes: received }];
 
     const speedBps = () => {
       const now = Date.now();
@@ -228,6 +321,7 @@ async function run(job, reporter = { progress() {} }) {
     const meter = new Transform({
       transform(chunk, _enc, cb) {
         received += chunk.length;
+        writtenThisAttempt += chunk.length;
 
         // Enforce the limits again while streaming: Content-Length may be absent or lie.
         if (env.limits.maxFileBytes && received > env.limits.maxFileBytes) {
@@ -235,7 +329,7 @@ async function run(job, reporter = { progress() {} }) {
             httpError(413, `File is larger than the ${formatMb(env.limits.maxFileBytes)} limit`)
           );
         }
-        if (quotaRemaining != null && received > quotaRemaining) {
+        if (quotaRemaining != null && writtenThisAttempt > quotaRemaining) {
           return cb(httpError(507, 'Storage quota reached'));
         }
 
@@ -284,10 +378,36 @@ async function run(job, reporter = { progress() {} }) {
       res.destroy(httpError(504, 'Remote server stopped sending data', { retryable: true }));
     });
 
+    const writeStream = fs.createWriteStream(dest, mode === 'append' ? { flags: 'a' } : undefined);
+
     try {
-      await pipeline(res, meter, fs.createWriteStream(dest), { signal: controller.signal });
+      await pipeline(res, meter, writeStream, { signal: controller.signal });
     } catch (err) {
-      throw normalizeAbort(err, controller);
+      const normalized = normalizeAbort(err, controller);
+      if (normalized.paused) {
+        // Count only bytes actually flushed to disk by THIS write stream, not
+        // what the meter saw upstream of it - a chunk can be counted by the
+        // meter microseconds before the writable side is torn down unflushed.
+        const onDisk = startAt + (writeStream.bytesWritten || 0);
+        pausedExit = true;
+        await updateJob(job.id, {
+          status: 'paused',
+          progress: total ? Math.min(99, Math.floor((onDisk / total) * 100)) : 0,
+          bytes_downloaded: onDisk,
+          bytes_total: total,
+          partial_stored_name: storedName,
+          error: null,
+        });
+        report({
+          id: job.id,
+          user_id: job.user_id,
+          status: 'paused',
+          progress: total ? Math.min(99, Math.floor((onDisk / total) * 100)) : 0,
+          bytes_downloaded: onDisk,
+          bytes_total: total,
+        });
+      }
+      throw normalized;
     }
 
     if (total && received !== total) {
@@ -318,6 +438,7 @@ async function run(job, reporter = { progress() {} }) {
       bytes_downloaded: received,
       bytes_total: total ?? received,
       file_id: result.insertId,
+      partial_stored_name: null,
     });
     report(doneSnapshot);
     return doneSnapshot;
@@ -325,8 +446,9 @@ async function run(job, reporter = { progress() {} }) {
     if (totalTimer) clearTimeout(totalTimer);
     activeJobs.unregisterController(job.id);
     await activeJobs.markFinished(job.user_id, job.id).catch(() => {});
-    // Anything still owned here is a partial file: never leave it behind.
-    if (storedName) await storage.removeFile(storedName).catch(() => {});
+    // Anything still owned here (and not a deliberate pause) is a partial
+    // file from a real failure/cancel: never leave it behind.
+    if (storedName && !pausedExit) await storage.removeFile(storedName).catch(() => {});
   }
 }
 
