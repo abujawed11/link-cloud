@@ -11,5 +11,6 @@ router.get('/events', c.eventsAll); // must come before /:id
 router.get('/:id', c.get);
 router.get('/:id/events', c.eventsOne);
 router.post('/:id/cancel', c.cancel);
+router.post('/:id/retry', jobLimiter, c.retry);
 
 module.exports = router;

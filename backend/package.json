@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
+    "worker:dev": "node --watch src/workers/downloadWorker.js",
+    "worker": "node src/workers/downloadWorker.js",
     "db:init": "node src/db/init.js",
     "db:seed-admin": "node src/db/seedAdmin.js"
   },
@@ -13,12 +15,14 @@
   "type": "commonjs",
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "bullmq": "^6.7.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
     "express-rate-limit": "^8.7.3",
     "helmet": "^8.3.0",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.12.1",
     "mysql2": "^3.24.6"

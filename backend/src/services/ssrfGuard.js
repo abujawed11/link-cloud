@@ -10,7 +10,10 @@ const dns = require('dns').promises;
 const net = require('net');
 const env = require('../config/env');
 
-const httpError = (status, message) => Object.assign(new Error(message), { status });
+// `retryable: false` tells the Phase 3 worker not to let BullMQ retry this job -
+// these are all deterministic (the URL, not the network, is the problem).
+const httpError = (status, message, opts = {}) =>
+  Object.assign(new Error(message), { status, retryable: opts.retryable ?? false });
 
 // Ports that are not plain web traffic are blocked outright.
 const ALLOWED_PORTS = new Set([80, 443, 8080, 8443, 8000, 3000]);

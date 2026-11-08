@@ -1,5 +1,9 @@
-// Queue-agnostic download logic. In Phase 3 a BullMQ worker will call start(jobId)
-// instead of the API calling it directly.
+// Streaming download logic. Deliberately decoupled from BullMQ: the worker
+// (src/workers/downloadWorker.js) is the only thing that knows this runs
+// inside a queue. It passes a `reporter` with one method, `progress(snapshot)`,
+// which the worker wires to `bullJob.updateProgress()`; the worker also makes
+// the retry/fail/cancel decision after `run()` throws, because that decision
+// needs BullMQ's attempt count, which this module has no business knowing.
 const fs = require('fs');
 const path = require('path');
 const { Transform } = require('stream');
@@ -9,10 +13,10 @@ const env = require('../config/env');
 const storage = require('./storageService');
 const { safeGet } = require('./httpClient');
 const { httpError } = require('./ssrfGuard');
-const events = require('./jobEvents');
+const activeJobs = require('./activeJobs');
 
 const DB_WRITE_INTERVAL_MS = 1000; // how often progress reaches MySQL
-const EVENT_INTERVAL_MS = 500; // how often progress reaches SSE clients
+const EVENT_INTERVAL_MS = 500; // how often progress reaches the reporter (-> SSE)
 const SPEED_WINDOW_MS = 5000; // sliding window used for speed and ETA
 const DISK_RECHECK_MS = 10000; // re-check free space while streaming
 
@@ -116,8 +120,9 @@ async function assertCanStore(userId, declaredSize) {
     }
   }
 
+  // Disk space can free up by the next attempt, so this one is worth retrying.
   const room = await storage.hasRoomFor(declaredSize || 0);
-  if (!room.ok) throw httpError(507, 'Not enough free disk space on the server');
+  if (!room.ok) throw httpError(507, 'Not enough free disk space on the server', { retryable: true });
 
   return { quotaRemaining };
 }
@@ -128,16 +133,40 @@ function normalizeAbort(err, controller) {
   const reason = controller.signal.reason;
   // An abort with no reason of our own (or the default DOMException) is a cancel.
   if (reason instanceof Error && reason.name !== 'AbortError') return reason;
-  return Object.assign(new Error('Download cancelled'), { cancelled: true });
+  return Object.assign(new Error('Download cancelled'), { cancelled: true, retryable: false });
 }
 
-async function run(job) {
+/**
+ * Run one attempt of a download job.
+ *
+ * @param {{id:number, user_id:number, url:string}} job - the minimal job shape;
+ *   either a MySQL row or the equivalent fields taken from a BullMQ job's data.
+ * @param {{progress(snapshot): void}} [reporter] - called often with a progress
+ *   snapshot; errors from it are swallowed (it is a side channel, not the
+ *   source of truth). Optional so this module stays usable without a queue.
+ *
+ * Throws on any failure (after cleaning up a partial file). The caller decides
+ * what that means for the job as a whole (retry, fail, or cancelled).
+ */
+async function run(job, reporter = { progress() {} }) {
+  const report = (snapshot) => {
+    try {
+      reporter.progress(snapshot);
+    } catch {
+      /* a broken reporter must not break the download */
+    }
+  };
+
   const controller = new AbortController();
-  events.registerActive(job.id, job.user_id, controller);
+  activeJobs.registerController(job.id, controller);
+  await activeJobs.markStarted(job.user_id, job.id).catch(() => {});
 
   const totalTimer = env.limits.totalTimeoutMs
     ? setTimeout(
-        () => controller.abort(new Error('Download exceeded the time limit')),
+        () =>
+          controller.abort(
+            Object.assign(new Error('Download exceeded the time limit'), { retryable: true })
+          ),
         env.limits.totalTimeoutMs
       )
     : null;
@@ -151,7 +180,7 @@ async function run(job) {
       bytes_total: null,
       error: null,
     });
-    events.publish({
+    report({
       id: job.id,
       user_id: job.user_id,
       status: 'downloading',
@@ -216,7 +245,7 @@ async function run(job) {
 
         if (now - lastEvent >= EVENT_INTERVAL_MS) {
           lastEvent = now;
-          events.publish({
+          report({
             id: job.id,
             user_id: job.user_id,
             status: 'downloading',
@@ -238,7 +267,11 @@ async function run(job) {
           storage
             .hasRoomFor(0)
             .then((room) => {
-              if (!room.ok) controller.abort(new Error('Server ran out of disk space'));
+              if (!room.ok) {
+                controller.abort(
+                  Object.assign(new Error('Server ran out of disk space'), { retryable: true })
+                );
+              }
             })
             .catch(() => {});
         }
@@ -248,7 +281,7 @@ async function run(job) {
 
     // Abort if the remote stalls: no data at all for idleTimeoutMs.
     res.setTimeout(env.limits.idleTimeoutMs, () => {
-      res.destroy(httpError(504, 'Remote server stopped sending data'));
+      res.destroy(httpError(504, 'Remote server stopped sending data', { retryable: true }));
     });
 
     try {
@@ -258,7 +291,9 @@ async function run(job) {
     }
 
     if (total && received !== total) {
-      throw httpError(502, `Incomplete download (${received} of ${total} bytes)`);
+      throw httpError(502, `Incomplete download (${received} of ${total} bytes)`, {
+        retryable: true,
+      });
     }
 
     const [result] = await pool.query(
@@ -268,14 +303,7 @@ async function run(job) {
     );
     storedName = null; // the file row owns it now
 
-    await updateJob(job.id, {
-      status: 'done',
-      progress: 100,
-      bytes_downloaded: received,
-      bytes_total: total ?? received,
-      file_id: result.insertId,
-    });
-    events.publish({
+    const doneSnapshot = {
       id: job.id,
       user_id: job.user_id,
       status: 'done',
@@ -283,36 +311,23 @@ async function run(job) {
       bytes_downloaded: received,
       bytes_total: total ?? received,
       file_id: result.insertId,
+    };
+    await updateJob(job.id, {
+      status: 'done',
+      progress: 100,
+      bytes_downloaded: received,
+      bytes_total: total ?? received,
+      file_id: result.insertId,
     });
+    report(doneSnapshot);
+    return doneSnapshot;
   } finally {
     if (totalTimer) clearTimeout(totalTimer);
-    events.unregisterActive(job.id);
+    activeJobs.unregisterController(job.id);
+    await activeJobs.markFinished(job.user_id, job.id).catch(() => {});
     // Anything still owned here is a partial file: never leave it behind.
     if (storedName) await storage.removeFile(storedName).catch(() => {});
   }
 }
 
-async function start(jobId) {
-  const [rows] = await pool.query('SELECT * FROM jobs WHERE id = ?', [jobId]);
-  const job = rows[0];
-  if (!job) return;
-  try {
-    await run(job);
-  } catch (err) {
-    const cancelled = err?.cancelled === true || err?.status === 499;
-    const message = String(err?.message || 'Download failed').slice(0, 1000);
-    if (!cancelled) console.error(`Job ${jobId} failed:`, message);
-    await updateJob(jobId, {
-      status: cancelled ? 'cancelled' : 'failed',
-      error: cancelled ? null : message,
-    }).catch(() => {});
-    events.publish({
-      id: Number(jobId),
-      user_id: job.user_id,
-      status: cancelled ? 'cancelled' : 'failed',
-      error: cancelled ? null : message,
-    });
-  }
-}
-
-module.exports = { start, userUsageBytes, pickFilename };
+module.exports = { run, updateJob, userUsageBytes, pickFilename };

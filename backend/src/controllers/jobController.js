@@ -3,36 +3,40 @@ const env = require('../config/env');
 const downloadService = require('../services/downloadService');
 const storage = require('../services/storageService');
 const events = require('../services/jobEvents');
+const activeJobs = require('../services/activeJobs');
+const { downloadQueue, addDownloadJob, getBullJob } = require('../queues/downloadQueue');
 const { assertUrlAllowed, httpError } = require('../services/ssrfGuard');
 
-exports.create = async (req, res) => {
-  // Reject private/loopback/metadata targets before a job row is even created.
-  const { url } = await assertUrlAllowed(req.body.url);
-
-  const running = events.activeCount(req.user.id);
+async function enqueue(userId, url) {
+  const running = await activeJobs.countActive(userId);
   if (running >= env.limits.maxConcurrentPerUser) {
     throw httpError(
       429,
       `You already have ${running} downloads running (limit ${env.limits.maxConcurrentPerUser}). Wait for one to finish.`
     );
   }
-
   if (env.limits.userQuotaBytes) {
-    const used = await downloadService.userUsageBytes(req.user.id);
+    const used = await downloadService.userUsageBytes(userId);
     if (used >= env.limits.userQuotaBytes) {
       throw httpError(507, 'Storage quota reached. Delete some files first.');
     }
   }
 
   const [result] = await pool.query('INSERT INTO jobs (user_id, url) VALUES (?, ?)', [
-    req.user.id,
-    url.toString(),
+    userId,
+    url,
   ]);
-  // Fire and forget. Phase 3: replace with queue.add()
-  downloadService.start(result.insertId);
+  await addDownloadJob({ dbJobId: result.insertId, userId, url });
 
   const [rows] = await pool.query('SELECT * FROM jobs WHERE id = ?', [result.insertId]);
-  res.status(201).json({ job: rows[0] });
+  return rows[0];
+}
+
+exports.create = async (req, res) => {
+  // Reject private/loopback/metadata targets before a job row is even created.
+  const { url } = await assertUrlAllowed(req.body.url);
+  const job = await enqueue(req.user.id, url.toString());
+  res.status(201).json({ job });
 };
 
 exports.list = async (req, res) => {
@@ -62,11 +66,38 @@ exports.cancel = async (req, res) => {
   if (!['queued', 'downloading'].includes(job.status)) {
     throw httpError(409, `Job is already ${job.status}`);
   }
-  if (!events.cancel(job.id)) {
-    // Not running in this process (e.g. left over from a restart): just mark it.
-    await pool.query("UPDATE jobs SET status = 'cancelled' WHERE id = ?", [job.id]);
+
+  const bullJob = await getBullJob(job.id);
+  if (bullJob && (await bullJob.isActive())) {
+    // Being processed right now: ask whichever worker owns it to abort the
+    // stream. That worker writes the final 'cancelled' status itself.
+    await activeJobs.requestCancel(job.id);
+  } else {
+    // Still waiting (or delayed for a retry) - nothing to interrupt, so this
+    // is the one place the API writes a terminal job status directly.
+    if (bullJob) await bullJob.remove().catch(() => {});
+    await pool.query("UPDATE jobs SET status = 'cancelled', error = NULL WHERE id = ?", [job.id]);
+    events.publish({ id: job.id, user_id: req.user.id, status: 'cancelled' });
   }
   res.json({ ok: true });
+};
+
+// Re-submit a failed download as a brand new job (fresh attempts, fresh row).
+exports.retry = async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM jobs WHERE id = ? AND user_id = ?', [
+    req.params.id,
+    req.user.id,
+  ]);
+  const original = rows[0];
+  if (!original) throw httpError(404, 'Job not found');
+  if (original.status !== 'failed') {
+    throw httpError(409, `Only a failed job can be retried (this one is ${original.status})`);
+  }
+
+  // Re-validate: the target or the allow-list may have changed since the first attempt.
+  const { url } = await assertUrlAllowed(original.url);
+  const job = await enqueue(req.user.id, url.toString());
+  res.status(201).json({ job });
 };
 
 // Storage usage for the signed-in user, for the dashboard header.
@@ -79,7 +110,7 @@ exports.usage = async (req, res) => {
     max_file_bytes: env.limits.maxFileBytes || null,
     server_free_bytes: free,
     max_concurrent: env.limits.maxConcurrentPerUser,
-    running: events.activeCount(req.user.id),
+    running: await activeJobs.countActive(req.user.id),
   });
 };
 

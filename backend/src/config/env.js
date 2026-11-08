@@ -21,6 +21,13 @@ module.exports = {
   allowRegistration: process.env.ALLOW_REGISTRATION === 'true',
   storageDir: process.env.STORAGE_DIR || './storage',
 
+  redis: {
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: num(process.env.REDIS_PORT, 6379),
+    password: process.env.REDIS_PASSWORD || undefined,
+    db: num(process.env.REDIS_DB, 0),
+  },
+
   // Phase 2 limits
   limits: {
     // Largest single file we will store.
@@ -38,6 +45,19 @@ module.exports = {
     // Hard cap on total download time (0 = none).
     totalTimeoutMs: num(process.env.TOTAL_TIMEOUT_MS, 6 * 60 * 60 * 1000),
     maxRedirects: num(process.env.MAX_REDIRECTS, 5),
+  },
+
+  // Phase 3: the worker process and its queue
+  queue: {
+    // Downloads running at once across ALL users, inside one worker process.
+    maxConcurrentGlobal: num(process.env.MAX_CONCURRENT_GLOBAL, 5) || 5,
+    // Attempts per job (including the first) before it is marked permanently failed.
+    retryAttempts: num(process.env.RETRY_ATTEMPTS, 3) || 1,
+    // Base delay for BullMQ's exponential backoff between attempts.
+    retryBackoffMs: num(process.env.RETRY_BACKOFF_MS, 10000),
+    // How long a stale per-user concurrency entry survives a crashed worker
+    // before it is evicted (must exceed totalTimeoutMs).
+    staleActiveMs: num(process.env.STALE_ACTIVE_MS, 0) || 6 * 60 * 60 * 1000 + 5 * 60 * 1000,
   },
 
   // Allow downloads from private/loopback addresses (development only).

@@ -24,6 +24,7 @@ function guardedLookup(hostname, options, callback) {
         return callback(
           Object.assign(new Error(`Host "${hostname}" resolves to a blocked address`), {
             status: 400,
+            retryable: false,
           })
         );
       }
@@ -64,14 +65,14 @@ function requestOnce(url, { signal }) {
     });
 
     req.setTimeout(env.limits.connectTimeoutMs, () => {
-      req.destroy(httpError(504, 'Timed out waiting for the remote server'));
+      req.destroy(httpError(504, 'Timed out waiting for the remote server', { retryable: true }));
     });
-    req.on('error', reject);
+    req.on('error', (err) => reject(Object.assign(err, { retryable: err.retryable ?? true })));
     if (signal) {
-      if (signal.aborted) return req.destroy(httpError(499, 'Cancelled'));
-      signal.addEventListener('abort', () => req.destroy(httpError(499, 'Cancelled')), {
-        once: true,
-      });
+      const cancelled = () =>
+        Object.assign(httpError(499, 'Cancelled', { retryable: false }), { cancelled: true });
+      if (signal.aborted) return req.destroy(cancelled());
+      signal.addEventListener('abort', () => req.destroy(cancelled()), { once: true });
     }
     req.end();
   });
@@ -92,9 +93,11 @@ async function safeGet(startUrl, { signal } = {}) {
     if (!REDIRECT_CODES.has(res.statusCode)) {
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume(); // drain so the socket can be released
+        // A remote 5xx might recover; a 4xx (dead link, forbidden, ...) will not.
         throw httpError(
           502,
-          `Remote server responded ${res.statusCode} ${res.statusMessage || ''}`.trim()
+          `Remote server responded ${res.statusCode} ${res.statusMessage || ''}`.trim(),
+          { retryable: res.statusCode >= 500 }
         );
       }
       // Headers are in; the connect timeout must not fire mid-download.
