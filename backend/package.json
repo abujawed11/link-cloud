@@ -10,6 +10,7 @@
     "worker": "node src/workers/downloadWorker.js",
     "db:init": "node src/db/init.js",
     "db:migrate": "node src/db/migrate.js",
+    "db:backfill-extensions": "node src/db/backfillExtensions.js",
     "db:seed-admin": "node src/db/seedAdmin.js"
   },
   "license": "ISC",

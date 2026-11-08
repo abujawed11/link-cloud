@@ -153,6 +153,18 @@ function normalizeAbort(err, controller) {
 // when resuming, and transparently falls back to a fresh full download if the
 // server doesn't honour it (ignores Range and sends everything again, or
 // 416s because the file changed since we paused).
+// The on-disk name is the real filename (collision-checked, not just an
+// opaque id) so the storage folder is browsable; files.original_name in the
+// DB is still the single source of truth for what gets shown to a user.
+function nameFromResponse(res, finalUrl, sourceUrl) {
+  return pickFilename({
+    disposition: res.headers['content-disposition'],
+    finalUrl,
+    sourceUrl,
+    contentType: res.headers['content-type'],
+  });
+}
+
 async function openStream(job, controller) {
   const resuming = Boolean(job.resumeFrom && job.partialStoredName);
 
@@ -163,7 +175,7 @@ async function openStream(job, controller) {
       res,
       finalUrl,
       mode: 'fresh',
-      storedName: storage.newStoredName(),
+      storedName: storage.uniqueStoredName(nameFromResponse(res, finalUrl, job.url)),
       startAt: 0,
       total: Number.isFinite(declared) && declared > 0 ? declared : null,
     };
@@ -196,7 +208,7 @@ async function openStream(job, controller) {
       res,
       finalUrl,
       mode: 'fresh',
-      storedName: storage.newStoredName(),
+      storedName: storage.uniqueStoredName(nameFromResponse(res, finalUrl, job.url)),
       startAt: 0,
       total: Number.isFinite(declared) && declared > 0 ? declared : null,
     };
