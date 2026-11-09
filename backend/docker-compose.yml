@@ -1,0 +1,34 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: link-cloud-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    network_mode: host
+
+  api:
+    build: .
+    container_name: link-cloud-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+    volumes:
+      - ./storage:/app/storage
+    network_mode: host
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    container_name: link-cloud-worker
+    restart: unless-stopped
+    command: ["node", "src/workers/downloadWorker.js"]
+    env_file: .env
+    environment:
+      NODE_ENV: production
+    volumes:
+      - ./storage:/app/storage
+    network_mode: host
+    depends_on:
+      - redis
