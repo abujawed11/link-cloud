@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import VideoPlayer from './VideoPlayer'
 
 export default function MediaPlayer({ file, onClose }) {
   const overlayRef = useRef(null)
@@ -40,11 +41,7 @@ export default function MediaPlayer({ file, onClose }) {
           </div>
         </div>
         <div className="player-body">
-          {isVideo && (
-            <video className="player-media" src={src} controls autoPlay>
-              Your browser does not support video playback.
-            </video>
-          )}
+          {isVideo && <VideoPlayer src={src} />}
           {isAudio && (
             <audio className="player-media player-audio" src={src} controls autoPlay>
               Your browser does not support audio playback.
