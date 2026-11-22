@@ -1,9 +1,13 @@
 import { useState } from 'react'
 import { api } from '../api/client'
 import { formatBytes, formatDate } from '../utils/format'
+import MediaPlayer from './MediaPlayer'
+
+const PREVIEWABLE = /^(video|audio|image)\//
 
 export default function FileList({ files, onChanged }) {
   const [error, setError] = useState('')
+  const [preview, setPreview] = useState(null)
 
   async function remove(file) {
     if (!window.confirm(`Delete "${file.original_name}" from the server?`)) return
@@ -31,6 +35,11 @@ export default function FileList({ files, onChanged }) {
                   {f.original_name}
                 </span>
                 <span className="actions">
+                  {PREVIEWABLE.test(f.mime_type || '') && (
+                    <button type="button" className="play-btn" onClick={() => setPreview(f)}>
+                      ▶ Play
+                    </button>
+                  )}
                   <a className="btn" href={`/api/files/${f.id}/download`}>
                     Download
                   </a>
@@ -46,6 +55,7 @@ export default function FileList({ files, onChanged }) {
           ))}
         </ul>
       )}
+      {preview && <MediaPlayer file={preview} onClose={() => setPreview(null)} />}
     </section>
   )
 }

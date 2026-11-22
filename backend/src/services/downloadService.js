@@ -16,6 +16,7 @@ const storage = require('./storageService');
 const { safeGet } = require('./httpClient');
 const { httpError } = require('./ssrfGuard');
 const activeJobs = require('./activeJobs');
+const { guessMime } = require('../utils/mimeGuess');
 
 const DB_WRITE_INTERVAL_MS = 1000; // how often progress reaches MySQL
 const EVENT_INTERVAL_MS = 500; // how often progress reaches the reporter (-> SSE)
@@ -314,6 +315,7 @@ async function run(job, reporter = { progress() {} }) {
       sourceUrl: job.url,
       contentType,
     });
+    const mimeType = guessMime(contentType, originalName);
     const dest = storage.filePath(storedName);
 
     let received = startAt; // absolute bytes accounted for, including any prior attempt
@@ -431,7 +433,7 @@ async function run(job, reporter = { progress() {} }) {
     const [result] = await pool.query(
       `INSERT INTO files (user_id, original_name, stored_name, size_bytes, mime_type, source_url)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [job.user_id, originalName, storedName, received, contentType, job.url]
+      [job.user_id, originalName, storedName, received, mimeType, job.url]
     );
     storedName = null; // the file row owns it now
 
