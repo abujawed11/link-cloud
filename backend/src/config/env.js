@@ -10,6 +10,16 @@ module.exports = {
   port: num(process.env.PORT, 4000),
   host: process.env.HOST || '127.0.0.1',
   nodeEnv: process.env.NODE_ENV || 'development',
+  // Defaults to the old NODE_ENV-tied behavior, but can be forced off for a
+  // plain-HTTP deployment (e.g. a LAN-only Docker setup) where NODE_ENV is
+  // still 'production' for logging/trust-proxy purposes. Needed because a
+  // Secure cookie set over plain HTTP is silently dropped by non-browser HTTP
+  // clients (e.g. .NET's CookieContainer) even on localhost, where browsers
+  // special-case it and let it through.
+  cookieSecure:
+    process.env.COOKIE_SECURE != null
+      ? process.env.COOKIE_SECURE === 'true'
+      : process.env.NODE_ENV === 'production',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
   db: {
     host: process.env.DB_HOST || 'localhost',

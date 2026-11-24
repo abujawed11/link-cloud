@@ -14,6 +14,7 @@ services:
     env_file: .env
     environment:
       NODE_ENV: production
+      COOKIE_SECURE: "false" # plain HTTP, no TLS in front - see config/env.js
       HOST: 0.0.0.0
       REDIS_HOST: redis
       DB_HOST: host.docker.internal
