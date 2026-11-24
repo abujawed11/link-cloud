@@ -8,6 +8,7 @@ const MB = 1024 * 1024;
 
 module.exports = {
   port: num(process.env.PORT, 4000),
+  host: process.env.HOST || '127.0.0.1',
   nodeEnv: process.env.NODE_ENV || 'development',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
   db: {
