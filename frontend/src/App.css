@@ -436,12 +436,15 @@ button.link {
 }
 .vp-seek-track {
   position: absolute;
+  top: 50%;
   left: 0;
   right: 0;
   height: 4px;
+  transform: translateY(-50%);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.28);
   overflow: hidden;
+  pointer-events: none;
 }
 .vp-seek-buffered {
   position: absolute;
@@ -457,34 +460,37 @@ button.link {
   left: 0;
   background: var(--accent);
 }
-.vp-seek-input {
-  position: relative;
-  width: 100%;
-  margin: 0;
-  height: 14px;
-  background: transparent;
-  -webkit-appearance: none;
-  appearance: none;
-  cursor: pointer;
-}
-.vp-seek-input::-webkit-slider-thumb {
-  -webkit-appearance: none;
+/* Custom thumb, positioned purely from React state (`left` = progress %).
+   Decoupled from the native input's own thumb/track rendering below, which
+   differs enough across browsers (default fill colors, track height,
+   pseudo-element centering math) that trying to reskin it in place kept
+   drifting out of alignment. */
+.vp-seek-thumb {
+  position: absolute;
+  top: 50%;
   width: 12px;
   height: 12px;
   border-radius: 999px;
   background: #fff;
   box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.15);
-  margin-top: -4px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
-.vp-seek-input::-moz-range-thumb {
-  width: 12px;
-  height: 12px;
-  border: 0;
-  border-radius: 999px;
-  background: #fff;
+
+/* The real <input type=range> is kept fully transparent and just handles
+   clicks/dragging/keyboard/touch; every pixel the user sees is the track +
+   thumb above, so there is nothing left for a browser to render inconsistently. */
+.vp-seek-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
 }
-.vp-seek-input::-moz-range-track {
-  background: transparent;
+.vp-seek-input:focus {
+  outline: none;
 }
 
 .vp-row {
@@ -529,11 +535,54 @@ button.link {
   align-items: center;
   gap: 0.3rem;
 }
-.vp-volume-input {
+.vp-volume-slider {
+  position: relative;
   width: 70px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+}
+.vp-volume-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
   height: 4px;
-  accent-color: var(--accent);
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.28);
+  overflow: hidden;
+  pointer-events: none;
+}
+.vp-volume-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: #fff;
+}
+.vp-volume-thumb {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #fff;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.15);
+  pointer-events: none;
+}
+.vp-volume-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
   cursor: pointer;
+}
+.vp-volume-input:focus {
+  outline: none;
 }
 
 .vp-speed-wrap {

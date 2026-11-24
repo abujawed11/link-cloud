@@ -102,6 +102,7 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
   const containerRef = useRef(null)
   const hideTimer = useRef(null)
   const scrubbingRef = useRef(false)
+  const playingRef = useRef(false)
 
   const [playing, setPlaying] = useState(false)
   const [ended, setEnded] = useState(false)
@@ -117,8 +118,16 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
+  useEffect(() => {
+    playingRef.current = playing
+  }, [playing])
+
+  // Controls only auto-hide while something is actually playing; paused,
+  // ended, or still loading, they stay up so a click-to-pause doesn't leave
+  // the user staring at a bar that vanishes on its own.
   const scheduleHide = useCallback(() => {
     clearTimeout(hideTimer.current)
+    if (!playingRef.current) return
     hideTimer.current = setTimeout(() => {
       if (!scrubbingRef.current) setControlsVisible(false)
     }, HIDE_DELAY_MS)
@@ -126,13 +135,36 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
 
   const wake = useCallback(() => {
     setControlsVisible(true)
-    setShowSpeedMenu((v) => v)
     scheduleHide()
   }, [scheduleHide])
 
   useEffect(() => {
-    wake()
     return () => clearTimeout(hideTimer.current)
+  }, [])
+
+  // Native listeners (not React's synthetic onMouseMove/onClick) so activity
+  // is still picked up reliably once the container is promoted to the
+  // Fullscreen API's top layer.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+
+    const handleActivity = () => wake()
+    const handleClick = (e) => {
+      if (e.target === videoRef.current) togglePlay()
+    }
+
+    el.addEventListener('mousemove', handleActivity)
+    el.addEventListener('mousedown', handleActivity)
+    el.addEventListener('touchstart', handleActivity, { passive: true })
+    el.addEventListener('click', handleClick)
+    return () => {
+      el.removeEventListener('mousemove', handleActivity)
+      el.removeEventListener('mousedown', handleActivity)
+      el.removeEventListener('touchstart', handleActivity)
+      el.removeEventListener('click', handleClick)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wake])
 
   useEffect(() => {
@@ -144,11 +176,17 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
     const onPlay = () => {
       setPlaying(true)
       setEnded(false)
+      wake() // start the auto-hide countdown now that playback has begun
     }
-    const onPause = () => setPlaying(false)
+    const onPause = () => {
+      setPlaying(false)
+      clearTimeout(hideTimer.current)
+      setControlsVisible(true)
+    }
     const onEnded = () => {
       setPlaying(false)
       setEnded(true)
+      clearTimeout(hideTimer.current)
       setControlsVisible(true)
     }
     const onWaiting = () => setLoading(true)
@@ -199,6 +237,7 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
       v.removeEventListener('error', onError)
       v.removeEventListener('volumechange', onVolumeChange)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -314,10 +353,6 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
       ref={containerRef}
       tabIndex={0}
       onKeyDown={onKeyDown}
-      onMouseMove={wake}
-      onClick={(e) => {
-        if (e.target === videoRef.current) togglePlay()
-      }}
     >
       <video
         ref={videoRef}
@@ -348,6 +383,7 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
             <div className="vp-seek-track">
               <div className="vp-seek-buffered" style={{ width: `${bufferedPct}%` }} />
               <div className="vp-seek-played" style={{ width: `${progressPct}%` }} />
+              <div className="vp-seek-thumb" style={{ left: `${progressPct}%` }} />
             </div>
             <input
               type="range"
@@ -379,16 +415,22 @@ export default function VideoPlayer({ src, poster, autoPlay = true }) {
                 <button type="button" className="vp-btn" onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>
                   <Icon name={volumeIcon()} />
                 </button>
-                <input
-                  type="range"
-                  className="vp-volume-input"
-                  min={0}
-                  max={1}
-                  step="0.01"
-                  value={muted ? 0 : volume}
-                  onChange={(e) => changeVolume(parseFloat(e.target.value))}
-                  aria-label="Volume"
-                />
+                <div className="vp-volume-slider">
+                  <div className="vp-volume-track">
+                    <div className="vp-volume-fill" style={{ width: `${(muted ? 0 : volume) * 100}%` }} />
+                    <div className="vp-volume-thumb" style={{ left: `${(muted ? 0 : volume) * 100}%` }} />
+                  </div>
+                  <input
+                    type="range"
+                    className="vp-volume-input"
+                    min={0}
+                    max={1}
+                    step="0.01"
+                    value={muted ? 0 : volume}
+                    onChange={(e) => changeVolume(parseFloat(e.target.value))}
+                    aria-label="Volume"
+                  />
+                </div>
               </div>
 
               <span className="vp-time">
