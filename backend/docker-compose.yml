@@ -14,12 +14,11 @@ services:
     env_file: .env
     environment:
       NODE_ENV: production
-      COOKIE_SECURE: "false" # plain HTTP, no TLS in front - see config/env.js
       HOST: 0.0.0.0
       REDIS_HOST: redis
       DB_HOST: host.docker.internal
     ports:
-      - "4000:4000"
+      - "${PORT:-4000}:${PORT:-4000}" # must match nginx's proxy_pass target on this host - see .env's PORT
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
