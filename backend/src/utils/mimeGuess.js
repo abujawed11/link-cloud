@@ -38,11 +38,19 @@ const BY_EXT = {
   '.avif': 'image/avif',
 };
 
+const MEDIA_TYPE = /^(video|audio|image)\//;
+
 // Given the Content-Type a remote server sent (possibly null/generic) and
 // the filename, returns the best mime type to store/serve.
+//
+// A real media Content-Type always wins. Otherwise, a known media extension
+// wins over whatever the server sent - not just over the generic types -
+// because file hosts often label media with non-media types such as
+// application/mp4, application/force-download or application/x-download,
+// which would hide the Play button for a perfectly playable .mp4.
 function guessMime(contentType, filename) {
   const normalized = (contentType || '').split(';')[0].trim().toLowerCase();
-  if (!GENERIC_TYPES.has(normalized)) return normalized || null;
+  if (MEDIA_TYPE.test(normalized)) return normalized;
 
   const ext = path.extname(filename || '').toLowerCase();
   return BY_EXT[ext] || normalized || null;
