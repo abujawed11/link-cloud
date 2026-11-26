@@ -88,6 +88,7 @@ worker.on('completed', (bullJob) => console.log(`Job ${bullJob.data.dbJobId} don
 worker.on('failed', (bullJob, err) => {
   if (err?.cancelled) console.log(`Job ${bullJob?.data?.dbJobId} cancelled`);
   else if (err?.paused) console.log(`Job ${bullJob?.data?.dbJobId} paused`);
+  else console.error(`Job ${bullJob?.data?.dbJobId} failed (attempt ${bullJob?.attemptsMade}): ${err?.message}`);
 });
 
 console.log(`Download worker started (concurrency ${env.queue.maxConcurrentGlobal})`);
