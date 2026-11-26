@@ -22,7 +22,7 @@ export default function UsageBar({ usage }) {
         <p className="muted small">{formatBytes(used)} used (no quota set)</p>
       )}
       <p className="muted small">
-        Max file size {formatBytes(maxFile)} &middot; up to {usage.max_concurrent} downloads at once
+        {maxFile ? `Max file size ${formatBytes(maxFile)}` : 'No file size limit'} &middot; up to {usage.max_concurrent} downloads at once
         {usage.server_free_bytes
           ? ` · ${formatBytes(usage.server_free_bytes)} free on the server`
           : ''}
